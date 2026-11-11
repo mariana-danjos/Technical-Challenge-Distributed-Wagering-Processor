@@ -1,0 +1,72 @@
+x-app-env: &app-env
+  LOG_LEVEL: info
+  DATABASE_URL: postgres://wagering:wagering@postgres:5432/wagering
+  AWS_REGION: us-east-1
+  AWS_ENDPOINT_URL: http://localstack:4566
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  SQS_WAGER_QUEUE_NAME: wager-transactions.fifo
+  SQS_WAGER_DLQ_NAME: wager-transactions-dlq.fifo
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: wagering
+      POSTGRES_PASSWORD: wagering
+      POSTGRES_DB: wagering
+    ports:
+      - "${POSTGRES_HOST_PORT:-5440}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wagering -d wagering"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  localstack:
+    image: localstack/localstack:4.4
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+    ports:
+      - "4566:4566"
+    volumes:
+      - ./docker/localstack/init-sqs.sh:/etc/localstack/init/ready.d/init-sqs.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name wager-transactions.fifo"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  migrate:
+    image: wagering-app:dev
+    build: .
+    profiles: ["app"]
+    command: ["bun", "run", "migration:up"]
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Scale with: docker compose --profile app up --scale app=3
+  app:
+    image: wagering-app:dev
+    build: .
+    profiles: ["app"]
+    environment:
+      <<: *app-env
+      PORT: 3000
+    ports:
+      - "3000-3005:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:

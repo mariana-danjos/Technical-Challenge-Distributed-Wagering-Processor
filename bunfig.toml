@@ -1,0 +1,7 @@
+[install]
+# Isolated node_modules: the hoisted layout resolves ajv-draft-04 (via @mikro-orm/migrations → umzug)
+# against eslint's ajv@6 instead of the ajv@8 it needs.
+linker = "isolated"
+
+[test]
+preload = ["reflect-metadata"]
