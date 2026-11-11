@@ -45,7 +45,9 @@ export class WagerTransactionMessageHandler implements MessageHandler {
           inbox: {
             consumerName: this.consumerName,
             messageId,
-            payloadHash: payloadHash(json as Record<string, unknown>),
+            // Business content only: a producer re-sending the same operation with a new
+            // occurredAt is a duplicate, not a conflicting payload.
+            payloadHash: payloadHash({ type: parsed.data.type, data: parsed.data.data }),
           },
         },
       );

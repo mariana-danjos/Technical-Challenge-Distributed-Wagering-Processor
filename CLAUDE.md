@@ -91,13 +91,28 @@ Messaging and workers:
   - ack: every business outcome, and duplicates;
   - dlq: malformed or invalid payloads, and payload conflicts. Sent to the DLQ explicitly, then deleted;
   - retry: transient or unexpected errors. Visibility is backed off by `ApproximateReceiveCount` (2s doubling, capped at 300s). The queue redrive (maxReceiveCount **30**, about 2h) moves the message to the DLQ. Every receive counts, including releases (shutdown, batch deadline, an earlier message of the group retrying), so the tail of a stuck group spends budget too. Don't lower it, or a short DB outage dead-letters valid wagers.
-- The consumer deletes the message only after the handler returns, i.e. after commit. Groups run in parallel and messages within a group sequentially. Stopping resets visibility to 0 for deliveries not yet started.
+- The consumer deletes the message only after the handler returns, i.e. after commit. Groups run in parallel (`Promise.allSettled`) and messages within a group sequentially.
+- An SQS error while settling one delivery is logged and contained; redelivery plus the inbox cover it.
+- `stop()` does **not** abort the long poll (that would strand deliveries SQS already handed out). It waits for the poll to return (≤ `waitTimeSeconds`, default 10) and resets visibility to 0 for deliveries not yet started.
+- The inbox `payloadHash` covers only `type` + `data`, so a producer re-send with a new `occurredAt` is a duplicate.
+- A same-key race resolved by the UNIQUE fallback also records the inbox receipt, but only together with the found duplicate.
+- Timeouts: the SQS client has `requestTimeout` 15s (must exceed the long-poll wait). Every unit of work sets `idle_in_transaction_session_timeout` 30s, so a stuck SQS call inside the outbox transaction cannot hold locks.
+- SQLSTATE classes `08`/`53` and `25P03` count as transient.
 - A message of a group is only *started* within the first half of the visibility window; the rest of the group is released. This keeps a slow group from being redelivered mid-processing.
 - **Don't add a `ChangeMessageVisibility` heartbeat**: LocalStack 4.4 rejects the original receipt handle on `DeleteMessage` once the initial window passes, even after extending it (verified).
 - **Outbox relay**: `claimDue` uses `FOR UPDATE SKIP LOCKED`. It publishes inside the claiming transaction, then marks the rows published or `scheduleRetry`. A crash before COMMIT means the event is re-sent with the same eventId.
 - Events go to `wager-events.fifo` (`SqsEventPublisher`: group = walletId, dedup id = eventId).
+- **Per-wallet event order is guaranteed.** `outbox_messages.sequence` is an identity, and it is commit-ordered per wallet only because **every outbox insert happens while holding that wallet's row lock** (submit, resolver, and the quarantine's `WagerTransactionFailed` all lock it). Any new code that enqueues events must do the same.
+- `claimDue` doesn't even lock events stuck behind an earlier one in backoff, so a stuck wallet can't starve the others. It returns only the head of line per aggregate: an event never leaves while an earlier unpublished event of its wallet is held by another publisher.
+- `claimed` in the result is the number of rows locked, which drives draining.
+- The publisher sends aggregates concurrently and each one in order. It stops an aggregate at its first rejected entry, failed call, or the 20s `PUBLISH_DEADLINE_MS`, which is below the 30s idle-in-transaction timeout.
+- Entries neither published nor failed are left untouched (no attempt counted). `sequence` is added to the published envelope.
+- Raw SQL bindings go through knex: an array bound to `?` expands to a comma list, so use `in (?)`, never `= any(?)`.
 - **Pending references**: the resolver claims one row at a time with `FOR NO KEY UPDATE SKIP LOCKED` (NO KEY so FK `KEY SHARE` from concurrent inserts never blocks), then locks the wallet. Lock order is tx row → wallet; the submit path only locks wallets, so the two cannot deadlock.
-- A row failing for a non-transient reason is quarantined in a separate unit of work: rescheduled with backoff on the same retry budget, then `FAILED`/`INTERNAL_ERROR`, reported via `Telemetry.pendingReferenceResolutionFailed`. This way it can't block the queue.
+- A row failing for a non-transient reason is quarantined so it can't block the queue. That includes a row that cannot even be loaded: the claim returns only `{transactionId, referenceAttempts}`, and loading is a separate step.
+- Quarantine runs in a separate unit of work as **compare-and-set SQL** on the claimed attempt count (`reschedulePendingReference` / `failPendingReference`), so a concurrent resolver's progress is never double-counted. It reschedules on the same retry budget plus one grace attempt.
+- After that the row becomes `FAILED`/`INTERNAL_ERROR`, with a `WagerTransactionFailed` event built from stored identifiers.
+- Telemetry (`pendingReferenceResolutionFailed`, `outboxPublishFailed`) is emitted only after COMMIT.
 - When a transaction is PROCESSED, `wakeDependents` makes parked transactions referencing it due now (`SKIP LOCKED` update).
 - All time comparisons use the application `Clock` passed as a parameter, never the DB's `now()`. Tests must do the same: the Docker VM clock drifts from the host, which made one test flaky.
 

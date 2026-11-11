@@ -3,10 +3,12 @@
 // issued in the order the caller chooses so foreign keys and triggers see a consistent sequence.
 import { LockMode, type FindOneOptions, type QueryResult } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/postgresql';
+import type { FailedTransactionRef } from '../../domain/events/wagering-events';
 import type { WalletLedgerEntry } from '../../domain/ledger/wallet-ledger-entry';
 import type { InboxMessage } from '../../domain/messaging/inbox-message';
 import type { OutboxMessage } from '../../domain/messaging/outbox-message';
 import type { Money } from '../../domain/money/money';
+import type { FailureCode } from '../../domain/wagering/failure-code';
 import type { WagerTransaction } from '../../domain/wagering/wager-transaction';
 import type { Wallet } from '../../domain/wallet/wallet';
 import type {
@@ -14,7 +16,9 @@ import type {
   InboxRepository,
   LedgerRepository,
   LedgerSnapshot,
+  OutboxClaim,
   OutboxRepository,
+  PendingReferenceClaim,
   StoredWagerTransaction,
   WagerTransactionRepository,
   WalletRepository,
@@ -150,32 +154,66 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
     if (affected !== 1) throw new Error(`Wager transaction ${transaction.id} not found for update`);
   }
 
-  async claimDuePendingReference(now: Date): Promise<StoredWagerTransaction | undefined> {
+  async findById(transactionId: string): Promise<StoredWagerTransaction | undefined> {
+    const record = await this.em.findOne(WagerTransactionSchema, { id: transactionId }, DETACHED);
+    return record ? this.toStored(record) : undefined;
+  }
+
+  async claimDuePendingReference(now: Date): Promise<PendingReferenceClaim | undefined> {
     // NO KEY UPDATE (not UPDATE): a concurrent insert whose FK points at this row takes KEY SHARE,
     // which must not block on — and deadlock with — the resolver holding this row.
-    const [claimed] = await this.em.execute<{ id: string }[]>(
-      `select id from wager_transactions
+    const [claimed] = await this.em.execute<{ id: string; reference_attempts: number }[]>(
+      `select id, reference_attempts from wager_transactions
         where status = 'PENDING_REFERENCE' and next_reference_check_at <= ?
         order by next_reference_check_at
         limit 1
         for no key update skip locked`,
       [now],
     );
-    if (!claimed) return undefined;
-    const record = await this.em.findOne(WagerTransactionSchema, { id: claimed.id }, DETACHED);
-    return record ? this.toStored(record) : undefined;
+    return claimed && { transactionId: claimed.id, referenceAttempts: claimed.reference_attempts };
   }
 
-  async lockPendingReference(transactionId: string): Promise<StoredWagerTransaction | undefined> {
-    const [locked] = await this.em.execute<{ id: string }[]>(
-      `select id from wager_transactions
-        where id = ? and status = 'PENDING_REFERENCE'
-        for no key update skip locked`,
-      [transactionId],
+  async reschedulePendingReference(claim: PendingReferenceClaim, nextCheckAt: Date): Promise<boolean> {
+    const result = await this.em.execute<QueryResult>(
+      `update wager_transactions
+          set reference_attempts = reference_attempts + 1, next_reference_check_at = ?
+        where id = ? and status = 'PENDING_REFERENCE' and reference_attempts = ?`,
+      [nextCheckAt, claim.transactionId, claim.referenceAttempts],
+      'run',
     );
-    if (!locked) return undefined;
-    const record = await this.em.findOne(WagerTransactionSchema, { id: locked.id }, DETACHED);
-    return record ? this.toStored(record) : undefined;
+    return result.affectedRows === 1;
+  }
+
+  async failPendingReference(
+    claim: PendingReferenceClaim,
+    failureCode: FailureCode,
+  ): Promise<FailedTransactionRef | undefined> {
+    const [row] = await this.em.execute<
+      {
+        id: string;
+        provider_id: string;
+        external_transaction_id: string;
+        wallet_id: string;
+        player_id: string;
+        kind: string;
+      }[]
+    >(
+      `update wager_transactions
+          set status = 'FAILED', failure_code = ?
+        where id = ? and status = 'PENDING_REFERENCE' and reference_attempts = ?
+        returning id, provider_id, external_transaction_id, wallet_id, player_id, kind`,
+      [failureCode, claim.transactionId, claim.referenceAttempts],
+    );
+    return (
+      row && {
+        transactionId: row.id,
+        providerId: row.provider_id,
+        externalTransactionId: row.external_transaction_id,
+        walletId: row.wallet_id,
+        playerId: row.player_id,
+        kind: row.kind,
+      }
+    );
   }
 
   async wakePendingReferences(
@@ -268,19 +306,49 @@ export class MikroOrmOutboxRepository implements OutboxRepository {
     await this.em.insertMany(OutboxSchema, messages.map(fromOutboxMessage));
   }
 
-  async claimDue(now: Date, limit: number): Promise<OutboxMessage[]> {
+  async claimDue(now: Date, limit: number): Promise<OutboxClaim> {
+    // 1. Lock a batch of due rows that are not stuck behind an earlier event of their aggregate in
+    //    backoff (those could never be published now and would starve every other wallet).
+    //    Concurrent publishers get disjoint batches.
+    const claimed = await this.em.execute<{ id: string; aggregate_id: string }[]>(
+      `select o.id, o.aggregate_id from outbox_messages o
+        where o.published_at is null and o.next_attempt_at <= ?
+          and not exists (
+            select 1 from outbox_messages p
+             where p.aggregate_id = o.aggregate_id and p.published_at is null
+               and p.sequence < o.sequence and p.next_attempt_at > ?)
+        order by o.sequence
+        limit ?
+        for update of o skip locked`,
+      [now, now, limit],
+    );
+    if (claimed.length === 0) return { locked: 0, publishable: [] };
+
+    // 2. Head of line per aggregate: walk each aggregate's unpublished events in order and keep the
+    //    claimed ones until the first that is not ours (held by another publisher, or in backoff).
+    const claimedIds = new Set(claimed.map((row) => row.id));
+    const aggregates = [...new Set(claimed.map((row) => row.aggregate_id))];
+    const pending = await this.em.execute<{ id: string; aggregate_id: string }[]>(
+      `select id, aggregate_id from outbox_messages
+        where published_at is null and aggregate_id in (?)
+        order by aggregate_id, sequence`,
+      [aggregates],
+    );
+    const publishable: string[] = [];
+    const blocked = new Set<string>();
+    for (const row of pending) {
+      if (blocked.has(row.aggregate_id)) continue;
+      if (claimedIds.has(row.id)) publishable.push(row.id);
+      else blocked.add(row.aggregate_id);
+    }
+    if (publishable.length === 0) return { locked: claimed.length, publishable: [] };
+
     const records = await this.em.find(
       OutboxSchema,
-      { publishedAt: null, nextAttemptAt: { $lte: now } },
-      {
-        ...DETACHED,
-        orderBy: { nextAttemptAt: 'asc' },
-        limit,
-        // FOR UPDATE SKIP LOCKED: concurrent publishers claim disjoint batches.
-        lockMode: LockMode.PESSIMISTIC_PARTIAL_WRITE,
-      },
+      { id: { $in: publishable } },
+      { ...DETACHED, orderBy: { sequence: 'asc' } },
     );
-    return records.map(toOutboxMessage);
+    return { locked: claimed.length, publishable: records.map(toOutboxMessage) };
   }
 
   async update(message: OutboxMessage): Promise<void> {

@@ -24,9 +24,18 @@ export interface UnitOfWorkOptions {
   /** Max wait for a row lock before failing transiently (hot-wallet back-pressure). */
   lockTimeoutMs: number;
   statementTimeoutMs: number;
+  /**
+   * Max time the transaction may sit idle between statements (e.g. while the outbox relay talks to
+   * SQS); PostgreSQL then ends the session so locks are never held by a stuck process.
+   */
+  idleInTransactionTimeoutMs: number;
 }
 
-const DEFAULT_OPTIONS: UnitOfWorkOptions = { lockTimeoutMs: 5_000, statementTimeoutMs: 10_000 };
+const DEFAULT_OPTIONS: UnitOfWorkOptions = {
+  lockTimeoutMs: 5_000,
+  statementTimeoutMs: 10_000,
+  idleInTransactionTimeoutMs: 30_000,
+};
 
 const UNIQUE_CONSTRAINTS: Record<string, Uniqueness> = {
   wallets_player_currency_uq: Uniqueness.WalletPlayerCurrency,
@@ -36,7 +45,9 @@ const UNIQUE_CONSTRAINTS: Record<string, Uniqueness> = {
 };
 
 /** SQLSTATEs worth retrying: serialization failure, statement timeout, admin shutdown, etc. */
-const TRANSIENT_SQLSTATES = new Set(['40001', '40P01', '55P03', '57014', '57P01', '57P02', '57P03']);
+const TRANSIENT_SQLSTATES = new Set(['40001', '40P01', '55P03', '57014', '57P01', '57P02', '57P03', '25P03']);
+/** Whole classes: 08 connection exceptions, 53 insufficient resources (e.g. too_many_connections). */
+const TRANSIENT_SQLSTATE_CLASSES = ['08', '53'];
 const TRANSIENT_NODE_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE']);
 
 /**
@@ -58,7 +69,8 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
       return await this.orm.em.fork().transactional(async (em) => {
         await em.execute(
           `set local lock_timeout = ${Math.trunc(this.options.lockTimeoutMs)};
-           set local statement_timeout = ${Math.trunc(this.options.statementTimeoutMs)}`,
+           set local statement_timeout = ${Math.trunc(this.options.statementTimeoutMs)};
+           set local idle_in_transaction_session_timeout = ${Math.trunc(this.options.idleInTransactionTimeoutMs)}`,
         );
         return work(repositoriesFor(em));
       });
@@ -66,6 +78,11 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
       throw translate(error);
     }
   }
+}
+
+function isTransientSqlState(code: string | undefined): boolean {
+  if (!code) return false;
+  return TRANSIENT_SQLSTATES.has(code) || TRANSIENT_SQLSTATE_CLASSES.some((cls) => code.startsWith(cls));
 }
 
 function repositoriesFor(em: EntityManager): Repositories {
@@ -90,7 +107,7 @@ function translate(error: unknown): unknown {
     error instanceof LockWaitTimeoutException ||
     error instanceof DeadlockException ||
     error instanceof ConnectionException ||
-    (error instanceof DriverException && TRANSIENT_SQLSTATES.has(error.code ?? ''))
+    (error instanceof DriverException && isTransientSqlState(error.code))
   ) {
     return new TransientInfrastructureError('Database temporarily unavailable', { cause: error });
   }

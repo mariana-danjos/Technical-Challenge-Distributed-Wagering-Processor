@@ -46,6 +46,11 @@ export const REFERENCE_RETRY_POLICY: BackoffPolicy & { maxAttempts: number } = {
   maxAttempts: 10,
 };
 
+/** When a transaction parked `attempts` times should next look for its reference. */
+export function nextReferenceCheckAt(attempts: number, now: Date): Date {
+  return addMilliseconds(now, exponentialBackoffDelay(attempts, REFERENCE_RETRY_POLICY));
+}
+
 export const OPENING_PROVIDER_ID = 'internal';
 
 export interface WagerTransactionState {
@@ -274,10 +279,7 @@ export class WagerTransaction {
     this.assertNotTerminal('markPendingReference');
     this._status = WagerTransactionStatus.PendingReference;
     this._referenceAttempts += 1;
-    this._nextReferenceCheckAt = addMilliseconds(
-      now,
-      exponentialBackoffDelay(this._referenceAttempts, REFERENCE_RETRY_POLICY),
-    );
+    this._nextReferenceCheckAt = nextReferenceCheckAt(this._referenceAttempts, now);
   }
 
   reject(code: FailureCode, referenceTransactionId?: string): void {

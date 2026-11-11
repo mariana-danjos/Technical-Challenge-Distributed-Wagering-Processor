@@ -84,27 +84,60 @@ export class SubmitWagerTransaction {
       if (!(error instanceof UniquenessViolationError)) throw error;
 
       if (error.uniqueness === Uniqueness.InboxMessage && options.inbox) {
-        const receipt = options.inbox;
-        const seen = await this.unitOfWork.run((repositories) =>
-          repositories.inbox.find(receipt.consumerName, receipt.messageId),
-        );
-        if (seen) {
-          return seen.payloadHash === receipt.payloadHash
-            ? { outcome: 'DUPLICATE_MESSAGE' }
-            : { outcome: 'MESSAGE_PAYLOAD_CONFLICT' };
-        }
+        const outcome = await this.inboxOutcome(options.inbox);
+        if (outcome) return outcome;
       }
       if (
         error.uniqueness === Uniqueness.WagerIdempotencyKey ||
         error.uniqueness === Uniqueness.WagerExternalId
       ) {
-        const existing = await this.unitOfWork.run((repositories) =>
-          this.findExisting(repositories, transaction),
-        );
-        if (existing) return existing;
+        return this.resolveDuplicateRace(transaction, options.inbox, error);
       }
       throw error;
     }
+  }
+
+  /**
+   * A concurrent duplicate committed first and the UNIQUE constraint rolled us back (inbox row
+   * included). Answer replay/conflict in a fresh unit of work, recording the inbox receipt there so
+   * a later redelivery is recognized. The receipt must never commit without the duplicate being
+   * found, or that redelivery would be acked with no effect.
+   */
+  private async resolveDuplicateRace(
+    transaction: WagerTransaction,
+    inbox: InboxReceipt | undefined,
+    cause: UniquenessViolationError,
+  ): Promise<SubmitWagerTransactionResult> {
+    try {
+      return await this.unitOfWork.run(async (repositories) => {
+        if (inbox) await this.recordInbox(repositories, inbox);
+        const existing = await this.findExisting(repositories, transaction);
+        if (!existing) throw cause;
+        return existing;
+      });
+    } catch (error) {
+      if (inbox && error instanceof UniquenessViolationError && error.uniqueness === Uniqueness.InboxMessage) {
+        const outcome = await this.inboxOutcome(inbox);
+        if (outcome) return outcome;
+      }
+      throw error;
+    }
+  }
+
+  private async inboxOutcome(receipt: InboxReceipt): Promise<SubmitWagerTransactionResult | undefined> {
+    const seen = await this.unitOfWork.run((repositories) =>
+      repositories.inbox.find(receipt.consumerName, receipt.messageId),
+    );
+    if (!seen) return undefined;
+    return seen.payloadHash === receipt.payloadHash
+      ? { outcome: 'DUPLICATE_MESSAGE' }
+      : { outcome: 'MESSAGE_PAYLOAD_CONFLICT' };
+  }
+
+  private async recordInbox(repositories: Repositories, receipt: InboxReceipt): Promise<void> {
+    const message = InboxMessage.receive({ ...receipt, receivedAt: this.clock.now() });
+    message.markProcessed(message.receivedAt);
+    await repositories.inbox.insert(message);
   }
 
   /** Validates the input through the domain factories; throws DomainError on invalid payloads. */
@@ -143,12 +176,8 @@ export class SubmitWagerTransaction {
     command: SubmitWagerTransactionCommand,
     inbox: InboxReceipt | undefined,
   ): Promise<SubmitWagerTransactionResult> {
-    if (inbox) {
-      // A duplicate delivery fails here on the primary key and rolls back everything.
-      const message = InboxMessage.receive({ ...inbox, receivedAt: this.clock.now() });
-      message.markProcessed(message.receivedAt);
-      await repositories.inbox.insert(message);
-    }
+    // A duplicate delivery fails here on the primary key and rolls back everything.
+    if (inbox) await this.recordInbox(repositories, inbox);
 
     const known = await this.findExisting(repositories, transaction);
     if (known) return known;

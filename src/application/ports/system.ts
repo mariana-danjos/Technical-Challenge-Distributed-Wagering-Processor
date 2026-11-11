@@ -27,8 +27,14 @@ export interface PendingReferenceFailure {
   error: unknown;
 }
 
+export interface OutboxPublishFailure {
+  messageIds: string[];
+  error: unknown;
+}
+
 /** Operational signals the application emits; implemented with logs/metrics in infrastructure. */
 export interface Telemetry {
   walletDivergenceDetected(divergence: WalletDivergence): void;
   pendingReferenceResolutionFailed(failure: PendingReferenceFailure): void;
+  outboxPublishFailed(failure: OutboxPublishFailure): void;
 }

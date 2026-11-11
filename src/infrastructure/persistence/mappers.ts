@@ -140,6 +140,7 @@ export function toOutboxMessage(record: OutboxRecord): OutboxMessage {
     attempts: record.attempts,
     nextAttemptAt: record.nextAttemptAt,
     publishedAt: record.publishedAt ?? undefined,
+    sequence: record.sequence == null ? undefined : String(record.sequence),
   });
 }
 

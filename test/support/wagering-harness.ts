@@ -2,6 +2,7 @@ import { expect } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import type { SQL } from 'bun';
 import type {
+  OutboxPublishFailure,
   PendingReferenceFailure,
   Telemetry,
   WalletDivergence,
@@ -22,6 +23,11 @@ import { setUpTestDatabase } from './test-database';
 export class RecordingTelemetry implements Telemetry {
   readonly divergences: WalletDivergence[] = [];
   readonly pendingReferenceFailures: PendingReferenceFailure[] = [];
+  readonly outboxPublishFailures: OutboxPublishFailure[] = [];
+
+  outboxPublishFailed(failure: OutboxPublishFailure): void {
+    this.outboxPublishFailures.push(failure);
+  }
 
   walletDivergenceDetected(divergence: WalletDivergence): void {
     this.divergences.push(divergence);

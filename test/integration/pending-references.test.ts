@@ -1,8 +1,13 @@
 // Requires `docker compose up -d postgres`. Out-of-order references (§7.1) against real PostgreSQL.
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
-import type { Repositories, UnitOfWork, WalletRepository } from '../../src/application/ports/unit-of-work';
+import type {
+  Repositories,
+  UnitOfWork,
+  WagerTransactionRepository,
+} from '../../src/application/ports/unit-of-work';
 import { ResolvePendingReferences } from '../../src/application/wagering/resolve-pending-references';
 import type { WalletView } from '../../src/application/wallets/open-wallet';
+import { FailureCode } from '../../src/domain/wagering/failure-code';
 import { REFERENCE_RETRY_POLICY } from '../../src/domain/wagering/wager-transaction';
 import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-orm-unit-of-work';
 import { SystemClock, UuidV7Generator } from '../../src/infrastructure/system/system-adapters';
@@ -62,26 +67,22 @@ async function resolveAllDue() {
   while ((await resolver.processDue(50)) > 0);
 }
 
-/** Makes processing of one wallet's rows fail with a non-transient error (a "poison" row). */
-class PoisonedWallet implements UnitOfWork {
+/** Makes one transaction unreadable (a "poison" row): loading it throws a non-transient error. */
+class Poisoned implements UnitOfWork {
   constructor(
     private readonly inner: UnitOfWork,
-    private readonly poisonWalletId: string,
+    private readonly poisonTransactionId: string,
   ) {}
 
   run<T>(work: (repositories: Repositories) => Promise<T>): Promise<T> {
     return this.inner.run((repositories) => {
-      const wallets = repositories.wallets;
-      const poisoned: WalletRepository = {
-        findById: (id) => wallets.findById(id),
-        lockById: async (id) => {
-          if (id === this.poisonWalletId) throw new Error('poisoned row');
-          return wallets.lockById(id);
-        },
-        insert: (wallet) => wallets.insert(wallet),
-        update: (wallet, version) => wallets.update(wallet, version),
+      const { transactions } = repositories;
+      const poisoned = Object.create(transactions) as WagerTransactionRepository;
+      poisoned.findById = async (id) => {
+        if (id === this.poisonTransactionId) throw new Error('unreadable row');
+        return transactions.findById(id);
       };
-      return work({ ...repositories, wallets: poisoned });
+      return work({ ...repositories, transactions: poisoned });
     });
   }
 }
@@ -141,7 +142,7 @@ describe('pending references', () => {
     expect(await expectLedgerConsistent(harness.sql, wallet.id)).toBe('100.00');
   });
 
-  it('a row that keeps failing does not block the others: rescheduled, then FAILED', async () => {
+  it('an unreadable row does not block the others: rescheduled, then FAILED with an event', async () => {
     const poisonWallet = await openTestWallet(harness, '100.00');
     const healthyWallet = await openTestWallet(harness, '100.00');
     const poison = await parkRefund(poisonWallet, '10.00');
@@ -154,7 +155,7 @@ describe('pending references', () => {
       update wager_transactions set next_reference_check_at = ${new Date(Date.now() - 60_000)}
        where id = ${poison.refundId}`;
     const guarded = new ResolvePendingReferences(
-      new PoisonedWallet(new MikroOrmUnitOfWork(harness.orm), poisonWallet.id),
+      new Poisoned(new MikroOrmUnitOfWork(harness.orm), poison.refundId),
       new SystemClock(),
       new UuidV7Generator(),
       harness.telemetry,
@@ -172,17 +173,55 @@ describe('pending references', () => {
       expect.objectContaining({ transactionId: poison.refundId, outcome: 'RESCHEDULED', attempts: 2 }),
     );
 
+    // On its last attempt it still gets one grace retry…
     await harness.sql`
       update wager_transactions
          set reference_attempts = ${REFERENCE_RETRY_POLICY.maxAttempts}, next_reference_check_at = ${new Date()}
        where id = ${poison.refundId}`;
+    while ((await guarded.processDue(50)) > 0);
+    expect(await transaction(poison.refundId)).toMatchObject({
+      status: 'PENDING_REFERENCE',
+      reference_attempts: REFERENCE_RETRY_POLICY.maxAttempts + 1,
+    });
+
+    // …and failing again past the budget is terminal: FAILED, with an event so nobody waits forever.
+    await harness.sql`update wager_transactions set next_reference_check_at = ${new Date()} where id = ${poison.refundId}`;
     while ((await guarded.processDue(50)) > 0);
 
     expect(await transaction(poison.refundId)).toMatchObject({ status: 'FAILED', failure_code: 'INTERNAL_ERROR' });
     expect(harness.telemetry.pendingReferenceFailures).toContainEqual(
       expect.objectContaining({ transactionId: poison.refundId, outcome: 'FAILED' }),
     );
+    const [failedEvent] = await harness.sql`
+      select payload from outbox_messages
+       where aggregate_id = ${poisonWallet.id} and event_type = 'WagerTransactionFailed'`;
+    expect(failedEvent.payload.data).toMatchObject({
+      transactionId: poison.refundId,
+      walletId: poisonWallet.id,
+      kind: 'REFUND',
+      failureCode: 'INTERNAL_ERROR',
+    });
     expect(await expectLedgerConsistent(harness.sql, poisonWallet.id)).toBe('100.00');
+  });
+
+  it('quarantine is compare-and-set: a row advanced by another resolver is left alone', async () => {
+    const wallet = await openTestWallet(harness, '100.00');
+    const { refundId } = await parkRefund(wallet, '10.00'); // attempts = 1
+    const staleClaim = { transactionId: refundId, referenceAttempts: 1 };
+    // Meanwhile another resolver rescheduled it.
+    await harness.sql`update wager_transactions set reference_attempts = 2 where id = ${refundId}`;
+
+    const unitOfWork = new MikroOrmUnitOfWork(harness.orm);
+    const rescheduled = await unitOfWork.run((r) =>
+      r.transactions.reschedulePendingReference(staleClaim, new Date(Date.now() + 60_000)),
+    );
+    const failed = await unitOfWork.run((r) =>
+      r.transactions.failPendingReference(staleClaim, FailureCode.InternalError),
+    );
+
+    expect(rescheduled).toBe(false);
+    expect(failed).toBeUndefined();
+    expect(await transaction(refundId)).toMatchObject({ status: 'PENDING_REFERENCE', reference_attempts: 2 });
   });
 
   it('concurrent resolvers share the work: every parked transaction is applied exactly once', async () => {

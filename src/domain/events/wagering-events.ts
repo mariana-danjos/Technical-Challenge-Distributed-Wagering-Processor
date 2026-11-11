@@ -118,6 +118,37 @@ export class WagerTransactionPendingReference extends IntegrationEvent<WagerTran
   }
 }
 
+/** Identifiers of a transaction, readable straight from storage without rehydrating it. */
+export interface FailedTransactionRef {
+  transactionId: string;
+  providerId: string;
+  externalTransactionId: string;
+  walletId: string;
+  playerId: string;
+  kind: string;
+}
+
+export interface WagerTransactionFailedData extends FailedTransactionRef {
+  failureCode: FailureCode;
+}
+
+/**
+ * Terminal infrastructure failure (status FAILED). Built from stored identifiers only, because the
+ * transaction may have failed precisely because it cannot be rehydrated.
+ */
+export class WagerTransactionFailed extends IntegrationEvent<WagerTransactionFailedData> {
+  readonly eventType = 'WagerTransactionFailed';
+  readonly version = 1;
+
+  static from(ref: FailedTransactionRef, failureCode: FailureCode, ctx: EventContext): WagerTransactionFailed {
+    return new WagerTransactionFailed({
+      ...ctx,
+      aggregateId: ref.walletId,
+      data: { ...ref, failureCode },
+    });
+  }
+}
+
 export interface WalletBalanceChangedData {
   walletId: string;
   transactionId: string;

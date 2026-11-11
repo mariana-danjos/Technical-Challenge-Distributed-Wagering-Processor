@@ -11,7 +11,13 @@ export const SQS_CLIENT = Symbol('SQS_CLIENT');
       provide: SQS_CLIENT,
       inject: [APP_CONFIG],
       useFactory: (config: AppConfig) =>
-        new SQSClient({ region: config.aws.region, endpoint: config.aws.endpoint }),
+        new SQSClient({
+          region: config.aws.region,
+          endpoint: config.aws.endpoint,
+          // Bounded calls: the outbox publishes inside an open SQL transaction, and shutdown waits
+          // for in-flight work. requestTimeout must exceed the consumer's long-poll wait (10s).
+          requestHandler: { connectionTimeout: 3_000, requestTimeout: 15_000 },
+        }),
     },
   ],
   exports: [SQS_CLIENT],

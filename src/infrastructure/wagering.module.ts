@@ -67,6 +67,7 @@ import { LoggingTelemetry, SystemClock, UuidV7Generator } from './system/system-
     UNIT_OF_WORK,
     CLOCK,
     ID_GENERATOR,
+    TELEMETRY,
   ],
 })
 export class WageringModule {}

@@ -1,9 +1,15 @@
+import { WagerTransactionFailed } from '../../domain/events/wagering-events';
+import { OutboxMessage } from '../../domain/messaging/outbox-message';
 import { FailureCode } from '../../domain/wagering/failure-code';
 import { settleWagerTransaction, type SettlementOutcome } from '../../domain/wagering/wager-settlement';
-import { WagerTransactionStatus } from '../../domain/wagering/wager-transaction';
+import {
+  REFERENCE_RETRY_POLICY,
+  WagerTransactionStatus,
+  nextReferenceCheckAt,
+} from '../../domain/wagering/wager-transaction';
 import { TransientInfrastructureError } from '../errors';
-import type { Clock, IdGenerator, Telemetry } from '../ports/system';
-import type { Repositories, UnitOfWork } from '../ports/unit-of-work';
+import type { Clock, IdGenerator, PendingReferenceFailure, Telemetry } from '../ports/system';
+import type { PendingReferenceClaim, Repositories, UnitOfWork } from '../ports/unit-of-work';
 import { resolveReference, settlementEvents, wakeDependents } from './settlement-support';
 
 export type ResolutionResult =
@@ -19,10 +25,12 @@ export type ResolutionResult =
  * Lock order is transaction row → wallet row. The submit path only ever locks wallets and inserts,
  * so the two paths cannot deadlock.
  *
- * Failure isolation: a row that fails for a non-transient reason (bug, constraint, trigger) would
- * otherwise roll back, stay due at the head of the queue and block every other row forever. It is
- * instead rescheduled in a separate unit of work — consuming the same retry budget — and marked
- * FAILED once the budget is spent. A transient failure ends the tick and leaves the row due.
+ * Failure isolation: a row that fails for a non-transient reason (bug, unreadable data, constraint,
+ * trigger) would otherwise roll back, stay due at the head of the queue and block every other row
+ * forever. Its id and attempt count are captured right after the claim — before loading — and it
+ * is quarantined in a separate unit of work with plain compare-and-set SQL (no rehydration):
+ * rescheduled with backoff on the same budget, with one grace attempt beyond it, then FAILED with
+ * a WagerTransactionFailed event. A transient failure ends the tick and leaves the row due.
  */
 export class ResolvePendingReferences {
   constructor(
@@ -36,15 +44,17 @@ export class ResolvePendingReferences {
   async processDue(limit: number): Promise<number> {
     let handled = 0;
     while (handled < limit) {
-      let claimedId: string | undefined;
+      const claimed: { value?: PendingReferenceClaim } = {};
       try {
         const result = await this.unitOfWork.run((repositories) =>
-          this.resolveNext(repositories, (id) => (claimedId = id)),
+          this.resolveNext(repositories, (claim) => (claimed.value = claim)),
         );
         if (!result) break;
       } catch (error) {
-        if (error instanceof TransientInfrastructureError || claimedId === undefined) throw error;
-        await this.quarantine(claimedId, error);
+        if (error instanceof TransientInfrastructureError || !claimed.value) throw error;
+        const failure = await this.quarantine(claimed.value, error);
+        // After COMMIT, so the signal never reports something that was rolled back.
+        if (failure) this.telemetry.pendingReferenceResolutionFailed(failure);
       }
       handled += 1;
     }
@@ -53,12 +63,15 @@ export class ResolvePendingReferences {
 
   private async resolveNext(
     repositories: Repositories,
-    onClaimed: (transactionId: string) => void,
+    onClaimed: (claim: PendingReferenceClaim) => void,
   ): Promise<ResolutionResult> {
-    const claimed = await repositories.transactions.claimDuePendingReference(this.clock.now());
-    if (!claimed) return undefined;
-    const { transaction } = claimed;
-    onClaimed(transaction.id);
+    const claim = await repositories.transactions.claimDuePendingReference(this.clock.now());
+    if (!claim) return undefined;
+    onClaimed(claim);
+
+    const stored = await repositories.transactions.findById(claim.transactionId);
+    if (!stored) throw new Error(`Claimed transaction ${claim.transactionId} disappeared`);
+    const { transaction } = stored;
 
     const wallet = await repositories.wallets.lockById(transaction.walletId);
     if (!wallet) throw new Error(`Wallet ${transaction.walletId} of ${transaction.id} not found`);
@@ -108,27 +121,52 @@ export class ResolvePendingReferences {
     };
   }
 
-  /** Moves a failing row out of the way: reschedule with backoff, or FAILED when out of budget. */
-  private async quarantine(transactionId: string, error: unknown): Promise<void> {
-    await this.unitOfWork.run(async (repositories) => {
-      const locked = await repositories.transactions.lockPendingReference(transactionId);
-      if (!locked) return; // settled or taken by another resolver meanwhile
-      const { transaction } = locked;
+  /**
+   * Moves a failing row out of the way. Compare-and-set on the claimed attempt count: if another
+   * resolver already advanced the row meanwhile, nothing is done (no double-spent budget).
+   */
+  private async quarantine(
+    claim: PendingReferenceClaim,
+    error: unknown,
+  ): Promise<PendingReferenceFailure | undefined> {
+    const now = this.clock.now();
+    // One grace attempt past the budget: a row woken on its last attempt is not failed by a single
+    // sporadic error.
+    const exhausted = claim.referenceAttempts > REFERENCE_RETRY_POLICY.maxAttempts;
 
-      const exhausted = transaction.hasExhaustedReferenceAttempts();
-      if (exhausted) {
-        transaction.fail(FailureCode.InternalError);
-      } else {
-        transaction.markPendingReference(this.clock.now());
+    return this.unitOfWork.run(async (repositories) => {
+      if (!exhausted) {
+        const attempts = claim.referenceAttempts + 1;
+        const rescheduled = await repositories.transactions.reschedulePendingReference(
+          claim,
+          nextReferenceCheckAt(attempts, now),
+        );
+        return rescheduled
+          ? { transactionId: claim.transactionId, outcome: 'RESCHEDULED' as const, attempts, error }
+          : undefined;
       }
-      await repositories.transactions.update(transaction);
 
-      this.telemetry.pendingReferenceResolutionFailed({
-        transactionId,
-        outcome: exhausted ? 'FAILED' : 'RESCHEDULED',
-        attempts: transaction.referenceAttempts,
+      const failed = await repositories.transactions.failPendingReference(claim, FailureCode.InternalError);
+      if (!failed) return undefined;
+      // Outbox sequence is only commit-ordered per wallet if every insert holds the wallet lock.
+      // Order stays transaction row → wallet, as in resolveNext.
+      await repositories.wallets.lockById(failed.walletId);
+      await repositories.outbox.enqueue([
+        OutboxMessage.enqueue(
+          WagerTransactionFailed.from(failed, FailureCode.InternalError, {
+            eventId: this.ids.next(),
+            correlationId: this.ids.next(),
+            causationId: claim.transactionId,
+            occurredAt: now,
+          }),
+        ),
+      ]);
+      return {
+        transactionId: claim.transactionId,
+        outcome: 'FAILED' as const,
+        attempts: claim.referenceAttempts,
         error,
-      });
+      };
     });
   }
 }

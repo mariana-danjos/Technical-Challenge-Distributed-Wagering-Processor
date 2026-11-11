@@ -34,7 +34,8 @@ export interface SqsQueueConsumerOptions {
 }
 
 export const DEFAULT_CONSUMER_OPTIONS = {
-  waitTimeSeconds: 20,
+  // Also the longest a shutdown waits for the current poll (it is not aborted, see stop()).
+  waitTimeSeconds: 10,
   visibilityTimeoutSeconds: 30,
   maxMessages: 10,
   retryBaseDelaySeconds: 2,
@@ -51,8 +52,11 @@ export const DEFAULT_CONSUMER_OPTIONS = {
  * - FIFO order: messages of one group run sequentially, groups in parallel; when a message is not
  *   acked, or the batch is running out of visibility time, the rest of its group is released so
  *   ordering is preserved;
- * - stop(): no new receives (the long poll is aborted), in-flight deliveries finish, and
- *   not-yet-started ones get their visibility reset to 0 so another consumer takes them now.
+ * - stop(): no new receives; the current long poll is allowed to return (aborting it could drop
+ *   deliveries SQS already handed out, leaving them invisible), in-flight deliveries finish, and
+ *   not-yet-started ones get their visibility reset to 0 so another consumer takes them now;
+ * - a failing SQS call while settling one delivery is logged and does not abort the batch: the
+ *   delivery simply reappears after its visibility timeout and the inbox absorbs the redelivery.
  */
 export class SqsQueueConsumer {
   private readonly logger = new Logger(SqsQueueConsumer.name);
@@ -60,7 +64,6 @@ export class SqsQueueConsumer {
   private running = false;
   private stopping = false;
   private loop: Promise<void> | undefined;
-  private abort = new AbortController();
 
   constructor(
     private readonly sqs: SQSClient,
@@ -74,19 +77,17 @@ export class SqsQueueConsumer {
     if (this.running) return;
     this.running = true;
     this.stopping = false;
-    this.abort = new AbortController();
     this.loop = this.run();
   }
 
   async stop(): Promise<void> {
     this.running = false;
     this.stopping = true;
-    this.abort.abort();
     await this.loop;
   }
 
   /** Receives and settles one batch. Returns the number of deliveries received. */
-  async pollOnce(signal?: AbortSignal): Promise<number> {
+  async pollOnce(): Promise<number> {
     const response = await this.sqs.send(
       new ReceiveMessageCommand({
         QueueUrl: this.options.queueUrl,
@@ -95,7 +96,6 @@ export class SqsQueueConsumer {
         VisibilityTimeout: this.options.visibilityTimeoutSeconds,
         MessageSystemAttributeNames: ['ApproximateReceiveCount', 'MessageGroupId'],
       }),
-      { abortSignal: signal },
     );
     // Visibility starts at delivery, i.e. when the long poll returns — not when it started.
     const receivedAt = Date.now();
@@ -107,14 +107,22 @@ export class SqsQueueConsumer {
       const group = message.Attributes?.MessageGroupId ?? message.MessageId ?? '';
       groups.set(group, [...(groups.get(group) ?? []), message]);
     }
-    await Promise.all([...groups.values()].map((group) => this.processGroup(group, receivedAt)));
+    // allSettled: one group failing must not leave the others running unawaited.
+    const results = await Promise.allSettled(
+      [...groups.values()].map((group) => this.processGroup(group, receivedAt)),
+    );
+    for (const result of results) {
+      if (result.status === 'rejected') {
+        this.logger.error({ err: result.reason }, 'Message group processing failed');
+      }
+    }
     return messages.length;
   }
 
   private async run(): Promise<void> {
     while (this.running) {
       try {
-        await this.pollOnce(this.abort.signal);
+        await this.pollOnce();
       } catch (error) {
         if (!this.running) break;
         this.logger.error({ err: error }, 'SQS poll failed; backing off');
@@ -159,6 +167,18 @@ export class SqsQueueConsumer {
     }
 
     const log = { messageId: message.MessageId, action: action.kind, ...action.context };
+    try {
+      await this.settle(message, action, log);
+    } catch (error) {
+      // e.g. an expired receipt handle: the delivery reappears later and the inbox dedups it.
+      this.logger.error({ ...log, err: error }, 'Could not settle delivery with SQS');
+    }
+
+    this.options.onSettled?.(message.MessageId ?? '', action);
+    return action;
+  }
+
+  private async settle(message: Message, action: MessageAction, log: Record<string, unknown>): Promise<void> {
     switch (action.kind) {
       case 'ack':
         await this.delete(message);
@@ -189,12 +209,17 @@ export class SqsQueueConsumer {
         this.logger.error({ ...log, reason: action.reason }, 'Message moved to DLQ');
         break;
     }
-    this.options.onSettled?.(message.MessageId ?? '', action);
-    return action;
   }
 
   private async release(messages: Message[]): Promise<void> {
-    await Promise.all(messages.map((message) => this.changeVisibility(message, 0)));
+    await Promise.all(
+      messages.map((message) =>
+        this.changeVisibility(message, 0).catch((error) =>
+          // Not fatal: the delivery becomes visible anyway when its timeout runs out.
+          this.logger.warn({ err: error, messageId: message.MessageId }, 'Could not release delivery'),
+        ),
+      ),
+    );
   }
 
   private async delete(message: Message): Promise<void> {

@@ -139,6 +139,8 @@ export interface OutboxRecord {
   attempts: number;
   nextAttemptAt: Date;
   publishedAt?: Date | null;
+  /** Identity assigned by the database; never written by the application. */
+  sequence?: string;
 }
 
 export const OutboxSchema = new EntitySchema<OutboxRecord>({
@@ -153,6 +155,7 @@ export const OutboxSchema = new EntitySchema<OutboxRecord>({
     attempts: { type: 'integer' },
     nextAttemptAt: { type: 'datetime' },
     publishedAt: { type: 'datetime', nullable: true },
+    sequence: { type: 'bigint', nullable: true },
   },
 });
 

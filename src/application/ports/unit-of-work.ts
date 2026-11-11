@@ -1,7 +1,9 @@
+import type { FailedTransactionRef } from '../../domain/events/wagering-events';
 import type { WalletLedgerEntry } from '../../domain/ledger/wallet-ledger-entry';
 import type { InboxMessage } from '../../domain/messaging/inbox-message';
 import type { OutboxMessage } from '../../domain/messaging/outbox-message';
 import type { Money } from '../../domain/money/money';
+import type { FailureCode } from '../../domain/wagering/failure-code';
 import type { WagerTransaction } from '../../domain/wagering/wager-transaction';
 import type { Wallet } from '../../domain/wallet/wallet';
 
@@ -28,6 +30,12 @@ export interface DuplicateLookup {
   externalTransactionId: string;
 }
 
+/** A claimed PENDING_REFERENCE row, read before (and independently of) rehydration. */
+export interface PendingReferenceClaim {
+  transactionId: string;
+  referenceAttempts: number;
+}
+
 export interface WagerTransactionRepository {
   /**
    * Transactions sharing the idempotency key or the (provider, external id) pair, read in ONE
@@ -47,13 +55,23 @@ export interface WagerTransactionRepository {
    * `observedBalance` is left unchanged when omitted.
    */
   update(transaction: WagerTransaction, observedBalance?: Money): Promise<void>;
+  findById(transactionId: string): Promise<StoredWagerTransaction | undefined>;
   /**
    * Claims one PENDING_REFERENCE transaction due at `now` (FOR NO KEY UPDATE SKIP LOCKED), so
-   * concurrent resolvers never pick the same row.
+   * concurrent resolvers never pick the same row. Returns raw identifiers only: loading the
+   * transaction is a separate step that may fail.
    */
-  claimDuePendingReference(now: Date): Promise<StoredWagerTransaction | undefined>;
-  /** Locks one specific PENDING_REFERENCE transaction (SKIP LOCKED); undefined if taken or settled. */
-  lockPendingReference(transactionId: string): Promise<StoredWagerTransaction | undefined>;
+  claimDuePendingReference(now: Date): Promise<PendingReferenceClaim | undefined>;
+  /**
+   * Compare-and-set, without rehydrating: reschedules the row only if it is still the version that
+   * was claimed (same status and attempt count). Returns false if anyone else changed it meanwhile.
+   */
+  reschedulePendingReference(claim: PendingReferenceClaim, nextCheckAt: Date): Promise<boolean>;
+  /** Compare-and-set to FAILED, without rehydrating. Returns the identifiers for the event. */
+  failPendingReference(
+    claim: PendingReferenceClaim,
+    failureCode: FailureCode,
+  ): Promise<FailedTransactionRef | undefined>;
   /**
    * Makes PENDING_REFERENCE transactions waiting for (providerId, externalTransactionId) due now.
    * Rows currently claimed by a resolver are skipped (it is already on them).
@@ -78,10 +96,22 @@ export interface LedgerRepository {
   snapshot(walletId: string): Promise<LedgerSnapshot | undefined>;
 }
 
+export interface OutboxClaim {
+  /** Rows locked by this claim (drives whether to keep draining). */
+  locked: number;
+  /** Locked rows that are next in line for their aggregate, in `sequence` order. */
+  publishable: OutboxMessage[];
+}
+
 export interface OutboxRepository {
   enqueue(messages: readonly OutboxMessage[]): Promise<void>;
-  /** Claims up to `limit` due messages (FOR UPDATE SKIP LOCKED) for the rest of the unit of work. */
-  claimDue(now: Date, limit: number): Promise<OutboxMessage[]>;
+  /**
+   * Claims due messages (FOR UPDATE SKIP LOCKED) and returns as publishable only those next in
+   * line for their aggregate — no earlier unpublished event of the same aggregate exists outside
+   * the claim — in `sequence` order. Events behind an earlier one in backoff are not even locked,
+   * so a stuck wallet never fills the batch and starves the others.
+   */
+  claimDue(now: Date, limit: number): Promise<OutboxClaim>;
   /** Persists attempts / nextAttemptAt / publishedAt. */
   update(message: OutboxMessage): Promise<void>;
 }

@@ -58,7 +58,12 @@ function startInstance(onSettled?: () => void) {
     waitTimeSeconds: 1,
     onSettled,
   });
-  const outbox = new PublishOutbox(unitOfWork, new SqsEventPublisher(sqs, async () => queues.eventsUrl), clock);
+  const outbox = new PublishOutbox(
+    unitOfWork,
+    new SqsEventPublisher(sqs, async () => queues.eventsUrl),
+    clock,
+    harness.telemetry,
+  );
   const resolver = new ResolvePendingReferences(unitOfWork, clock, ids, harness.telemetry);
   const loops = [
     new PollingLoop('outbox', async () => (await outbox.publishBatch()).claimed === 10, 50),

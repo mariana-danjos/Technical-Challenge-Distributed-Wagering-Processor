@@ -161,6 +161,33 @@ describe('SQS consumer', () => {
     await drain(sqs, queues.dlqUrl);
   });
 
+  it('a producer re-send with a new occurredAt is a duplicate, not a payload conflict', async () => {
+    const wallet = await openTestWallet(harness, '100.00');
+    const original = wagerMessage(wallet, 'BET', '10.00');
+    const resent = { ...original, occurredAt: new Date(Date.now() + 5_000).toISOString() };
+    await send(sqs, queues.queueUrl, original, wallet.id);
+    await send(sqs, queues.queueUrl, resent, wallet.id);
+
+    const { instance, settled } = consumer();
+    while ((await instance.pollOnce()) > 0);
+
+    expect(settled.map((s) => s.action)).toEqual([
+      expect.objectContaining({ kind: 'ack' }),
+      expect.objectContaining({ kind: 'ack', context: expect.objectContaining({ outcome: 'DUPLICATE_MESSAGE' }) }),
+    ]);
+    expect(await countRows(harness.sql, 'debits', wallet.id)).toBe(1);
+  });
+
+  it('an SQS failure while acking is logged and contained, not thrown', async () => {
+    const acking: MessageHandler = { handle: async () => ({ kind: 'ack' }) };
+    const { instance, settled } = consumer({}, acking);
+
+    const action = await instance.process({ MessageId: 'm-1', Body: '{}', ReceiptHandle: 'not-a-valid-receipt-handle' });
+
+    expect(action.kind).toBe('ack');
+    expect(settled).toHaveLength(1);
+  });
+
   it('the same messageId with a different payload goes to the DLQ', async () => {
     const wallet = await openTestWallet(harness, '100.00');
     const original = wagerMessage(wallet, 'BET', '10.00');

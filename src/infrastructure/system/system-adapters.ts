@@ -2,6 +2,7 @@ import { Logger } from '@nestjs/common';
 import type {
   Clock,
   IdGenerator,
+  OutboxPublishFailure,
   PendingReferenceFailure,
   Telemetry,
   WalletDivergence,
@@ -31,5 +32,9 @@ export class LoggingTelemetry implements Telemetry {
 
   pendingReferenceResolutionFailed({ error, ...failure }: PendingReferenceFailure): void {
     this.logger.error({ ...failure, err: error }, 'Pending reference could not be resolved');
+  }
+
+  outboxPublishFailed({ error, messageIds }: OutboxPublishFailure): void {
+    this.logger.error({ err: error, messageIds, count: messageIds.length }, 'Outbox publish failed');
   }
 }

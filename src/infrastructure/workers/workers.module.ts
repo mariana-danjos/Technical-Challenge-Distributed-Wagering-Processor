@@ -8,7 +8,7 @@ import {
   type OnApplicationBootstrap,
 } from '@nestjs/common';
 import { PublishOutbox } from '../../application/messaging/publish-outbox';
-import { CLOCK, type Clock } from '../../application/ports/system';
+import { CLOCK, TELEMETRY, type Clock, type Telemetry } from '../../application/ports/system';
 import { UNIT_OF_WORK, type UnitOfWork } from '../../application/ports/unit-of-work';
 import { ResolvePendingReferences } from '../../application/wagering/resolve-pending-references';
 import { SubmitWagerTransaction } from '../../application/wagering/submit-wager-transaction';
@@ -112,10 +112,11 @@ export class WorkersService implements OnApplicationBootstrap, BeforeApplication
     },
     {
       provide: PublishOutbox,
-      inject: [UNIT_OF_WORK, CLOCK, SQS_CLIENT, SqsQueueUrls, APP_CONFIG],
+      inject: [UNIT_OF_WORK, CLOCK, TELEMETRY, SQS_CLIENT, SqsQueueUrls, APP_CONFIG],
       useFactory: (
         uow: UnitOfWork,
         clock: Clock,
+        telemetry: Telemetry,
         sqs: SQSClient,
         urls: SqsQueueUrls,
         config: AppConfig,
@@ -124,6 +125,7 @@ export class WorkersService implements OnApplicationBootstrap, BeforeApplication
           uow,
           new SqsEventPublisher(sqs, () => urls.resolve(config.sqs.wagerEventsQueueName)),
           clock,
+          telemetry,
           OUTBOX_BATCH_SIZE,
         ),
     },

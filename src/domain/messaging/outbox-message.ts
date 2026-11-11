@@ -17,6 +17,8 @@ export interface OutboxMessageState {
   attempts: number;
   nextAttemptAt: Date;
   publishedAt: Date | undefined;
+  /** Per-aggregate publication order, assigned by the database on insert. */
+  sequence: string | undefined;
 }
 
 export class OutboxMessage {
@@ -29,6 +31,7 @@ export class OutboxMessage {
     private _attempts: number,
     private _nextAttemptAt: Date,
     private _publishedAt: Date | undefined,
+    public readonly sequence: string | undefined,
   ) {}
 
   /** The outbox id is the event id, so a duplicate publish carries the same id downstream. */
@@ -41,6 +44,7 @@ export class OutboxMessage {
       event.occurredAt,
       0,
       event.occurredAt,
+      undefined,
       undefined,
     );
   }
@@ -55,6 +59,7 @@ export class OutboxMessage {
       state.attempts,
       state.nextAttemptAt,
       state.publishedAt,
+      state.sequence,
     );
   }
 
