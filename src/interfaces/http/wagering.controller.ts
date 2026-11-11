@@ -8,7 +8,7 @@ import {
 import { WagerTransactionStatus } from '../../domain/wagering/wager-transaction';
 import { CorrelationId } from './correlation-id';
 import { ApiError, ApiErrorCode } from './errors/api-error';
-import { idempotencyKeySchema, parse, submitWagerTransactionSchema } from './schemas';
+import { idempotencyKeySchema, parse, submitWagerTransactionSchema } from '../contracts';
 
 /**
  * Status of a recorded transaction → HTTP. A replay returns the same code as the original.
@@ -86,5 +86,9 @@ function present(result: SubmitWagerTransactionResult) {
       );
     case 'WALLET_NOT_FOUND':
       throw new ApiError(404, ApiErrorCode.WalletNotFound, 'Wallet not found');
+    case 'DUPLICATE_MESSAGE':
+    case 'MESSAGE_PAYLOAD_CONFLICT':
+      // Inbox outcomes only exist for queue deliveries; HTTP never passes an inbox receipt.
+      throw new Error(`Unexpected outcome for an HTTP request: ${result.outcome}`);
   }
 }

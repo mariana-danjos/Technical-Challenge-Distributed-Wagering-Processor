@@ -9,6 +9,7 @@ describe('health endpoints (real PostgreSQL + LocalStack)', () => {
   let baseUrl: string;
 
   beforeAll(async () => {
+    process.env.WORKERS_ENABLED = 'false';
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
     app = moduleRef.createNestApplication({ logger: false });
     await app.listen(0);

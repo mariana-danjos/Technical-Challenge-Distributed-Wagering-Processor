@@ -10,6 +10,7 @@ export enum Uniqueness {
   WalletPlayerCurrency = 'WALLET_PLAYER_CURRENCY',
   WagerIdempotencyKey = 'WAGER_IDEMPOTENCY_KEY',
   WagerExternalId = 'WAGER_EXTERNAL_ID',
+  InboxMessage = 'INBOX_MESSAGE',
   Other = 'OTHER',
 }
 

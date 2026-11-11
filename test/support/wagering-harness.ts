@@ -1,7 +1,11 @@
 import { expect } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import type { SQL } from 'bun';
-import type { Telemetry, WalletDivergence } from '../../src/application/ports/system';
+import type {
+  PendingReferenceFailure,
+  Telemetry,
+  WalletDivergence,
+} from '../../src/application/ports/system';
 import {
   SubmitWagerTransaction,
   type SubmitWagerTransactionCommand,
@@ -17,9 +21,14 @@ import { setUpTestDatabase } from './test-database';
 
 export class RecordingTelemetry implements Telemetry {
   readonly divergences: WalletDivergence[] = [];
+  readonly pendingReferenceFailures: PendingReferenceFailure[] = [];
 
   walletDivergenceDetected(divergence: WalletDivergence): void {
     this.divergences.push(divergence);
+  }
+
+  pendingReferenceResolutionFailed(failure: PendingReferenceFailure): void {
+    this.pendingReferenceFailures.push(failure);
   }
 }
 

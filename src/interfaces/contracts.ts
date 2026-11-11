@@ -1,7 +1,7 @@
-// Request contracts. zod checks the JSON shape and rejects unknown fields (.strict()); money
-// semantics (decimal format, scale, currency) are validated by the domain `Money`.
+// Inbound contracts shared by HTTP and SQS. zod checks the JSON shape and rejects unknown fields
+// (.strict()); money semantics (decimal format, scale, currency) are validated by the domain `Money`.
 import { z } from 'zod';
-import { ApiError } from './errors/api-error';
+import { ApiError } from './http/errors/api-error';
 
 const identifier = z.string().trim().min(1).max(128);
 
@@ -43,6 +43,18 @@ export const idempotencyKeySchema = z
   .max(255)
   .regex(/^[\x21-\x7e]+$/, 'Idempotency-Key must be printable ASCII without spaces');
 
+/** SQS message (§10). `data` is the HTTP body plus the idempotency key. */
+export const wagerTransactionRequestedSchema = z
+  .object({
+    messageId: identifier,
+    type: z.literal('WagerTransactionRequested'),
+    occurredAt: z.string().datetime({ offset: true }),
+    data: submitWagerTransactionSchema.extend({ idempotencyKey: idempotencyKeySchema }).strict(),
+  })
+  .strict();
+
+export type WagerTransactionRequested = z.output<typeof wagerTransactionRequestedSchema>;
+
 export const ledgerQuerySchema = z
   .object({
     cursor: z.string().max(512).optional(),
@@ -50,6 +62,7 @@ export const ledgerQuerySchema = z
   })
   .strict();
 
+/** Parses an HTTP input or throws a 400 ApiError. */
 export function parse<T extends z.ZodTypeAny>(schema: T, input: unknown): z.output<T> {
   const result = schema.safeParse(input);
   if (!result.success) {

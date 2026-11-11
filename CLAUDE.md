@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-Done so far: scaffold (NestJS, health endpoints, MikroORM migrations, SQS client, Docker Compose), the **domain layer**, the **schema**, **persistence** and the **use cases** (`SubmitWagerTransaction`, `OpenWallet`, `ReconcileWallet`), with concurrency tests. Not built yet: HTTP API, SQS consumer, outbox and pending-reference workers, multi-process test, metrics, `ARCHITECTURE.md`. The **challenge specification** (Jungle Gaming — Distributed Wagering Processor, written in Portuguese) lives in `docs/CHALLENGE.md`. It is the source of truth for requirements; section numbers below (§) refer to it. `README.md` is currently still a copy of the spec and is meant to be rewritten.
+Done so far: scaffold (NestJS, health endpoints, MikroORM migrations, SQS client, Docker Compose), the **domain layer**, the **schema**, **persistence** and the **use cases** (`SubmitWagerTransaction`, `OpenWallet`, `ReconcileWallet`) with concurrency tests, the **HTTP API** (§9), and **messaging** (SQS consumer, outbox relay, pending-reference resolver; §7.1, §10, §11). Not built yet: multi-process test, metrics, final `README.md`, `ARCHITECTURE.md`. The **challenge specification** (Jungle Gaming — Distributed Wagering Processor, written in Portuguese) lives in `docs/CHALLENGE.md`. It is the source of truth for requirements; section numbers below (§) refer to it. `README.md` is currently still a copy of the spec and is meant to be rewritten.
 
 Required deliverables per the spec: a `README.md` with setup and commands, and an `ARCHITECTURE.md` justifying decisions, trade-offs and limitations (ORM choice, `Money` mapping, transactional/locking strategy, failure-code taxonomy, retry limits/TTL, idempotency hash algorithm, HTTP status mapping, auth decision).
 
@@ -69,6 +69,38 @@ Application and persistence:
 - `wager_transactions.observed_balance` (wallet currency) is what replays return as the original balance.
 - Outbox payloads are deep-copied in the mapper because MikroORM mutates query params in place and event data is frozen.
 
+HTTP layer (`src/interfaces/http/`):
+- `HttpApiModule` holds the controllers, the global `ApiExceptionFilter` and the global `AuthGuard`.
+- `toErrorResponse` in `errors/api-exception.filter.ts` is the **single** failure→HTTP mapping. Throw `ApiError` or let domain/application errors propagate; don't build error responses in controllers.
+- Error body is always `{ error: { code, message, details? } }`.
+- Submit statuses (replays return the original code): PROCESSED 200, PENDING_REFERENCE 202, REJECTED 422 (+`failureCode`).
+- Error statuses: invalid payload or missing `Idempotency-Key` 400, idempotency conflict 409, unknown wallet 404 `WALLET_NOT_FOUND`, `TransientInfrastructureError` 503 + `Retry-After`. A `DomainError` is 400, except `InvalidTransactionStateError`, which is a bug and returns 500.
+- Request contracts in `schemas.ts` (zod, `.strict()`: unknown fields are 400). zod checks shape only; money format is validated by the domain `Money`.
+- `X-Correlation-Id` is resolved in pino-http `genReqId` (`correlation-id.ts`). It's echoed on responses, logged, and passed into commands and events via `@CorrelationId()`.
+- Ledger pagination: `ledger-cursor.ts` (base64url `{v, w: walletId, s: sequence}`). A cursor from another wallet is rejected.
+- Auth: `auth/auth.ts` is the extension point (`REQUEST_AUTHENTICATOR`, default allow-all; `@Public()` for health). No IdP by design.
+- Read endpoints go through the `WageringQueries` port (`MikroOrmWageringQueries`), not the use cases.
+
+Messaging and workers:
+- `WorkersModule` (`infrastructure/workers/`) runs three workers in **every** app instance, toggled by `WORKERS_ENABLED`: the SQS consumer, the outbox relay (`PublishOutbox`) and the pending-reference resolver (`ResolvePendingReferences`).
+- They stop in `beforeApplicationShutdown`, so they finish before the ORM and SQS client close.
+- Test harnesses set `WORKERS_ENABLED=false`.
+- **SQS consumer** (`SqsQueueConsumer`) is generic over a `MessageHandler`. `WagerTransactionMessageHandler` (`interfaces/messaging/`) parses the §10 envelope (`interfaces/contracts.ts`, shared with HTTP) and calls the same `SubmitWagerTransaction`, passing an `inbox` receipt.
+- The inbox row is the first write of the same unit of work. A duplicate delivery hits `inbox_messages_pk`, and the result is `DUPLICATE_MESSAGE` (or `MESSAGE_PAYLOAD_CONFLICT`).
+- Message actions:
+  - ack: every business outcome, and duplicates;
+  - dlq: malformed or invalid payloads, and payload conflicts. Sent to the DLQ explicitly, then deleted;
+  - retry: transient or unexpected errors. Visibility is backed off by `ApproximateReceiveCount` (2s doubling, capped at 300s). The queue redrive (maxReceiveCount **30**, about 2h) moves the message to the DLQ. Every receive counts, including releases (shutdown, batch deadline, an earlier message of the group retrying), so the tail of a stuck group spends budget too. Don't lower it, or a short DB outage dead-letters valid wagers.
+- The consumer deletes the message only after the handler returns, i.e. after commit. Groups run in parallel and messages within a group sequentially. Stopping resets visibility to 0 for deliveries not yet started.
+- A message of a group is only *started* within the first half of the visibility window; the rest of the group is released. This keeps a slow group from being redelivered mid-processing.
+- **Don't add a `ChangeMessageVisibility` heartbeat**: LocalStack 4.4 rejects the original receipt handle on `DeleteMessage` once the initial window passes, even after extending it (verified).
+- **Outbox relay**: `claimDue` uses `FOR UPDATE SKIP LOCKED`. It publishes inside the claiming transaction, then marks the rows published or `scheduleRetry`. A crash before COMMIT means the event is re-sent with the same eventId.
+- Events go to `wager-events.fifo` (`SqsEventPublisher`: group = walletId, dedup id = eventId).
+- **Pending references**: the resolver claims one row at a time with `FOR NO KEY UPDATE SKIP LOCKED` (NO KEY so FK `KEY SHARE` from concurrent inserts never blocks), then locks the wallet. Lock order is tx row → wallet; the submit path only locks wallets, so the two cannot deadlock.
+- A row failing for a non-transient reason is quarantined in a separate unit of work: rescheduled with backoff on the same retry budget, then `FAILED`/`INTERNAL_ERROR`, reported via `Telemetry.pendingReferenceResolutionFailed`. This way it can't block the queue.
+- When a transaction is PROCESSED, `wakeDependents` makes parked transactions referencing it due now (`SKIP LOCKED` update).
+- All time comparisons use the application `Clock` passed as a parameter, never the DB's `now()`. Tests must do the same: the Docker VM clock drifts from the host, which made one test flaky.
+
 Schema (`migrations/Migration20261111164422_core_schema.ts`) enforces the invariants itself; read its header before changing persistence:
 - Every money column is `numeric(19,2)`.
 - The ledger is append-only (UPDATE/DELETE/TRUNCATE blocked by triggers). An insert trigger locks the wallet row, assigns `sequence` (the per-wallet pagination cursor) and checks the chain `balance_before` = previous `balance_after`.
@@ -84,7 +116,7 @@ Interpretations adopted (to be documented in `ARCHITECTURE.md`):
 - WIN/LOSS may optionally reference a BET; when they do, the same reference rules apply.
 - Amounts are > 0, except LOSS, which may be 0.
 
-Tests: `test/support/domain-fixtures.ts` holds the domain builders. `test/support/wagering-harness.ts` builds the real use cases on the test DB and has `expectLedgerConsistent` (the mandatory final invariant), `wagerCommand` and `holdWalletLock` (holds a row lock from another connection, to prove per-wallet locking and lock timeouts). Concurrency tests are statistical: when touching them, run `bun test test/integration/concurrency.test.ts` several times in a row. Integration tests that touch the schema use the separate `wagering_test` database (created on demand by `test/support/test-database.ts`; override with `TEST_DATABASE_URL`). That's because `schema.test.ts` migrates down and up. Tables are append-only, so tests isolate with random UUIDs instead of cleanup.
+Tests: `test/support/domain-fixtures.ts` holds the domain builders. `test/support/wagering-harness.ts` builds the real use cases on the test DB and has `expectLedgerConsistent` (the mandatory final invariant), `wagerCommand` and `holdWalletLock` (holds a row lock from another connection, to prove per-wallet locking and lock timeouts). `test/support/messaging-harness.ts` creates per-file LocalStack FIFO queues (main with redrive, DLQ, events), plus `wagerMessage`, `send`, `drain` and `waitFor`. Outbox/recovery tests first mark leftover pending outbox rows as published, because the test DB is shared across files. `test/support/http-harness.ts` boots the real `AppModule` on the test DB for E2E HTTP tests (`http-api.test.ts`). Concurrency tests are statistical: when touching them, run `bun test test/integration/concurrency.test.ts` several times in a row. Integration tests that touch the schema use the separate `wagering_test` database (created on demand by `test/support/test-database.ts`; override with `TEST_DATABASE_URL`). That's because `schema.test.ts` migrates down and up. Tables are append-only, so tests isolate with random UUIDs instead of cleanup.
 
 ## Non-negotiable constraints (§5, §14 eliminatory failures)
 

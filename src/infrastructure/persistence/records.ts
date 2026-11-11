@@ -110,6 +110,26 @@ export const LedgerEntrySchema = new EntitySchema<LedgerEntryRecord>({
   },
 });
 
+export interface InboxRecord {
+  consumerName: string;
+  messageId: string;
+  payloadHash: string;
+  receivedAt: Date;
+  processedAt?: Date | null;
+}
+
+export const InboxSchema = new EntitySchema<InboxRecord>({
+  name: 'InboxRecord',
+  tableName: 'inbox_messages',
+  properties: {
+    consumerName: { type: 'text', primary: true },
+    messageId: { type: 'text', primary: true },
+    payloadHash: { type: 'string', columnType: 'char(64)' },
+    receivedAt: { type: 'datetime' },
+    processedAt: { type: 'datetime', nullable: true },
+  },
+});
+
 export interface OutboxRecord {
   id: string;
   aggregateId: string;
@@ -136,4 +156,10 @@ export const OutboxSchema = new EntitySchema<OutboxRecord>({
   },
 });
 
-export const persistenceSchemas = [WalletSchema, WagerTransactionSchema, LedgerEntrySchema, OutboxSchema];
+export const persistenceSchemas = [
+  WalletSchema,
+  WagerTransactionSchema,
+  LedgerEntrySchema,
+  InboxSchema,
+  OutboxSchema,
+];

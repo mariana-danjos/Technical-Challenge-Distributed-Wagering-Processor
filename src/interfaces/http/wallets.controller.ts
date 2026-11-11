@@ -5,7 +5,7 @@ import { ReconcileWallet } from '../../application/wallets/reconcile-wallet';
 import { CorrelationId } from './correlation-id';
 import { ApiError, ApiErrorCode } from './errors/api-error';
 import { LedgerCursor } from './ledger-cursor';
-import { ledgerQuerySchema, openWalletSchema, parse } from './schemas';
+import { ledgerQuerySchema, openWalletSchema, parse } from '../contracts';
 
 @Controller('wallets')
 export class WalletsController {

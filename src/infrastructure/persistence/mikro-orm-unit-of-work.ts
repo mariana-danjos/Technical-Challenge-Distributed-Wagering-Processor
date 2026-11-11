@@ -13,6 +13,7 @@ import {
 } from '../../application/errors';
 import type { Repositories, UnitOfWork } from '../../application/ports/unit-of-work';
 import {
+  MikroOrmInboxRepository,
   MikroOrmLedgerRepository,
   MikroOrmOutboxRepository,
   MikroOrmWagerTransactionRepository,
@@ -31,6 +32,7 @@ const UNIQUE_CONSTRAINTS: Record<string, Uniqueness> = {
   wallets_player_currency_uq: Uniqueness.WalletPlayerCurrency,
   wager_transactions_idempotency_key_uq: Uniqueness.WagerIdempotencyKey,
   wager_transactions_provider_external_uq: Uniqueness.WagerExternalId,
+  inbox_messages_pk: Uniqueness.InboxMessage,
 };
 
 /** SQLSTATEs worth retrying: serialization failure, statement timeout, admin shutdown, etc. */
@@ -71,6 +73,7 @@ function repositoriesFor(em: EntityManager): Repositories {
     wallets: new MikroOrmWalletRepository(em),
     transactions: new MikroOrmWagerTransactionRepository(em),
     ledger: new MikroOrmLedgerRepository(em),
+    inbox: new MikroOrmInboxRepository(em),
     outbox: new MikroOrmOutboxRepository(em),
   };
 }

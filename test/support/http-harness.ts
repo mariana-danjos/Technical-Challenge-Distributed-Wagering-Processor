@@ -24,6 +24,7 @@ export async function startHttpHarness(): Promise<HttpHarness> {
 
   process.env.DATABASE_URL = TEST_DATABASE_URL;
   process.env.LOG_LEVEL ??= 'silent';
+  process.env.WORKERS_ENABLED = 'false';
   const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
   const app: INestApplication = moduleRef.createNestApplication({ logger: false });
   await app.listen(0);

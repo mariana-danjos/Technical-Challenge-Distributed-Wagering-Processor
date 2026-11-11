@@ -13,6 +13,12 @@ describe('loadConfig', () => {
     expect(config.sqs.wagerDlqName).toBe('wager-transactions-dlq.fifo');
   });
 
+  it('enables workers by default and parses WORKERS_ENABLED strictly', () => {
+    expect(loadConfig(baseEnv).workers.enabled).toBe(true);
+    expect(loadConfig({ ...baseEnv, WORKERS_ENABLED: 'false' }).workers.enabled).toBe(false);
+    expect(() => loadConfig({ ...baseEnv, WORKERS_ENABLED: 'no' })).toThrow('WORKERS_ENABLED');
+  });
+
   it('fails fast when DATABASE_URL is missing', () => {
     expect(() => loadConfig({})).toThrow('DATABASE_URL');
   });

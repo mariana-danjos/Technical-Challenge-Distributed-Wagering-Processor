@@ -10,6 +10,7 @@ import {
 } from '../application/ports/system';
 import { WAGERING_QUERIES } from '../application/ports/queries';
 import { UNIT_OF_WORK, type UnitOfWork } from '../application/ports/unit-of-work';
+import { ResolvePendingReferences } from '../application/wagering/resolve-pending-references';
 import { SubmitWagerTransaction } from '../application/wagering/submit-wager-transaction';
 import { OpenWallet } from '../application/wallets/open-wallet';
 import { ReconcileWallet } from '../application/wallets/reconcile-wallet';
@@ -40,6 +41,12 @@ import { LoggingTelemetry, SystemClock, UuidV7Generator } from './system/system-
         new SubmitWagerTransaction(uow, clock, ids),
     },
     {
+      provide: ResolvePendingReferences,
+      inject: [UNIT_OF_WORK, CLOCK, ID_GENERATOR, TELEMETRY],
+      useFactory: (uow: UnitOfWork, clock: Clock, ids: IdGenerator, telemetry: Telemetry) =>
+        new ResolvePendingReferences(uow, clock, ids, telemetry),
+    },
+    {
       provide: OpenWallet,
       inject: [UNIT_OF_WORK, CLOCK, ID_GENERATOR],
       useFactory: (uow: UnitOfWork, clock: Clock, ids: IdGenerator) =>
@@ -51,6 +58,15 @@ import { LoggingTelemetry, SystemClock, UuidV7Generator } from './system/system-
       useFactory: (uow: UnitOfWork, telemetry: Telemetry) => new ReconcileWallet(uow, telemetry),
     },
   ],
-  exports: [SubmitWagerTransaction, OpenWallet, ReconcileWallet, WAGERING_QUERIES],
+  exports: [
+    SubmitWagerTransaction,
+    ResolvePendingReferences,
+    OpenWallet,
+    ReconcileWallet,
+    WAGERING_QUERIES,
+    UNIT_OF_WORK,
+    CLOCK,
+    ID_GENERATOR,
+  ],
 })
 export class WageringModule {}

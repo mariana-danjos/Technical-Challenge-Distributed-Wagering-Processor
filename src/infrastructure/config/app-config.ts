@@ -11,6 +11,11 @@ export interface AppConfig {
   sqs: {
     wagerQueueName: string;
     wagerDlqName: string;
+    wagerEventsQueueName: string;
+  };
+  /** Background workers (SQS consumer, outbox publisher, pending-reference resolver). */
+  workers: {
+    enabled: boolean;
   };
 }
 
@@ -28,6 +33,10 @@ export function loadConfig(env: Env): AppConfig {
     sqs: {
       wagerQueueName: env.SQS_WAGER_QUEUE_NAME ?? 'wager-transactions.fifo',
       wagerDlqName: env.SQS_WAGER_DLQ_NAME ?? 'wager-transactions-dlq.fifo',
+      wagerEventsQueueName: env.SQS_WAGER_EVENTS_QUEUE_NAME ?? 'wager-events.fifo',
+    },
+    workers: {
+      enabled: parseBoolean('WORKERS_ENABLED', env.WORKERS_ENABLED ?? 'true'),
     },
   };
 }
@@ -38,6 +47,12 @@ function required(env: Env, key: string): string {
     throw new Error(`Missing required environment variable ${key}`);
   }
   return value;
+}
+
+function parseBoolean(key: string, raw: string): boolean {
+  if (raw === 'true') return true;
+  if (raw === 'false') return false;
+  throw new Error(`Invalid ${key}: "${raw}" (expected true or false)`);
 }
 
 function parsePort(raw: string): number {

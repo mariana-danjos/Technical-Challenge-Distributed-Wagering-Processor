@@ -1,5 +1,6 @@
 import type { LedgerDirection, WalletLedgerEntry } from '../../domain/ledger/wallet-ledger-entry';
-import type { OutboxMessage } from '../../domain/messaging/outbox-message';
+import { InboxMessage } from '../../domain/messaging/inbox-message';
+import { OutboxMessage } from '../../domain/messaging/outbox-message';
 import { Money } from '../../domain/money/money';
 import type { FailureCode } from '../../domain/wagering/failure-code';
 import {
@@ -9,6 +10,7 @@ import {
 } from '../../domain/wagering/wager-transaction';
 import { Wallet } from '../../domain/wallet/wallet';
 import type {
+  InboxRecord,
   LedgerEntryRecord,
   OutboxRecord,
   WagerTransactionRecord,
@@ -73,7 +75,7 @@ export function toWagerTransaction(record: WagerTransactionRecord): WagerTransac
 
 export function fromWagerTransaction(
   transaction: WagerTransaction,
-  observedBalance: Money,
+  observedBalance: Money | undefined,
 ): WagerTransactionRecord {
   return {
     id: transaction.id,
@@ -96,7 +98,7 @@ export function fromWagerTransaction(
     nextReferenceCheckAt: transaction.nextReferenceCheckAt ?? null,
     createdAt: transaction.createdAt,
     processedAt: transaction.processedAt ?? null,
-    observedBalance: observedBalance.toString(),
+    observedBalance: observedBalance?.toString() ?? null,
   };
 }
 
@@ -126,4 +128,37 @@ export function fromOutboxMessage(message: OutboxMessage): OutboxRecord {
     nextAttemptAt: message.nextAttemptAt,
     publishedAt: message.publishedAt ?? null,
   };
+}
+
+export function toOutboxMessage(record: OutboxRecord): OutboxMessage {
+  return OutboxMessage.rehydrate({
+    id: record.id,
+    aggregateId: record.aggregateId,
+    eventType: record.eventType,
+    payload: record.payload,
+    occurredAt: record.occurredAt,
+    attempts: record.attempts,
+    nextAttemptAt: record.nextAttemptAt,
+    publishedAt: record.publishedAt ?? undefined,
+  });
+}
+
+export function fromInboxMessage(message: InboxMessage): InboxRecord {
+  return {
+    consumerName: message.consumerName,
+    messageId: message.messageId,
+    payloadHash: message.payloadHash,
+    receivedAt: message.receivedAt,
+    processedAt: message.processedAt ?? null,
+  };
+}
+
+export function toInboxMessage(record: InboxRecord): InboxMessage {
+  return InboxMessage.rehydrate({
+    consumerName: record.consumerName,
+    messageId: record.messageId,
+    payloadHash: record.payloadHash,
+    receivedAt: record.receivedAt,
+    processedAt: record.processedAt ?? undefined,
+  });
 }

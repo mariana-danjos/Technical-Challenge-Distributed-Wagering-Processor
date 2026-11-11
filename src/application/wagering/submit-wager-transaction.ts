@@ -1,27 +1,17 @@
-import type { EventContext } from '../../domain/events/integration-event';
-import {
-  WagerTransactionPendingReference,
-  WagerTransactionProcessed,
-  WagerTransactionRejected,
-  WalletBalanceChanged,
-} from '../../domain/events/wagering-events';
-import { OutboxMessage } from '../../domain/messaging/outbox-message';
+import { InboxMessage } from '../../domain/messaging/inbox-message';
 import { Money, type MoneyProps } from '../../domain/money/money';
 import type { FailureCode } from '../../domain/wagering/failure-code';
-import {
-  settleWagerTransaction,
-  type SettlementOutcome,
-} from '../../domain/wagering/wager-settlement';
+import { settleWagerTransaction } from '../../domain/wagering/wager-settlement';
 import {
   WagerTransaction,
   WagerTransactionStatus,
   type WagerTransactionKind,
 } from '../../domain/wagering/wager-transaction';
-import type { Wallet } from '../../domain/wallet/wallet';
 import { Uniqueness, UniquenessViolationError } from '../errors';
 import { payloadHash } from '../idempotency/payload-hash';
 import type { Clock, IdGenerator } from '../ports/system';
 import type { Repositories, StoredWagerTransaction, UnitOfWork } from '../ports/unit-of-work';
+import { resolveReference, settlementEvents, wakeDependents } from './settlement-support';
 
 export interface SubmitWagerTransactionCommand {
   idempotencyKey: string;
@@ -38,6 +28,13 @@ export interface SubmitWagerTransactionCommand {
   causationId?: string | undefined;
 }
 
+/** Queue delivery being processed; recorded in the inbox inside the same SQL transaction. */
+export interface InboxReceipt {
+  consumerName: string;
+  messageId: string;
+  payloadHash: string;
+}
+
 export type SubmitWagerTransactionResult =
   | {
       outcome: 'RECORDED';
@@ -49,7 +46,11 @@ export type SubmitWagerTransactionResult =
     }
   /** Same idempotency key with another payload, or same external id under another key. */
   | { outcome: 'IDEMPOTENCY_CONFLICT'; transactionId: string }
-  | { outcome: 'WALLET_NOT_FOUND' };
+  | { outcome: 'WALLET_NOT_FOUND' }
+  /** Inbox: this message was already processed (redelivery). Nothing was done. */
+  | { outcome: 'DUPLICATE_MESSAGE' }
+  /** Inbox: same message id seen before with a different payload. */
+  | { outcome: 'MESSAGE_PAYLOAD_CONFLICT' };
 
 /**
  * Single entry point for provider transactions (HTTP and SQS).
@@ -59,6 +60,8 @@ export type SubmitWagerTransactionResult =
  * Idempotency: checked before the lock (fast path) and again under it; a concurrent duplicate
  * that slipped past both (different wallet → different lock) is caught by the database UNIQUE
  * constraints and resolved as replay/conflict in a fresh unit of work.
+ * Inbox (SQS): the inbox row is the first write of the unit of work, so a redelivered message
+ * either finds it committed together with the financial effect, or finds nothing at all.
  */
 export class SubmitWagerTransaction {
   constructor(
@@ -67,18 +70,33 @@ export class SubmitWagerTransaction {
     private readonly ids: IdGenerator,
   ) {}
 
-  async execute(command: SubmitWagerTransactionCommand): Promise<SubmitWagerTransactionResult> {
+  async execute(
+    command: SubmitWagerTransactionCommand,
+    options: { inbox?: InboxReceipt } = {},
+  ): Promise<SubmitWagerTransactionResult> {
     const transaction = this.toTransaction(command);
 
     try {
       return await this.unitOfWork.run((repositories) =>
-        this.submit(repositories, transaction, command),
+        this.submit(repositories, transaction, command, options.inbox),
       );
     } catch (error) {
+      if (!(error instanceof UniquenessViolationError)) throw error;
+
+      if (error.uniqueness === Uniqueness.InboxMessage && options.inbox) {
+        const receipt = options.inbox;
+        const seen = await this.unitOfWork.run((repositories) =>
+          repositories.inbox.find(receipt.consumerName, receipt.messageId),
+        );
+        if (seen) {
+          return seen.payloadHash === receipt.payloadHash
+            ? { outcome: 'DUPLICATE_MESSAGE' }
+            : { outcome: 'MESSAGE_PAYLOAD_CONFLICT' };
+        }
+      }
       if (
-        error instanceof UniquenessViolationError &&
-        (error.uniqueness === Uniqueness.WagerIdempotencyKey ||
-          error.uniqueness === Uniqueness.WagerExternalId)
+        error.uniqueness === Uniqueness.WagerIdempotencyKey ||
+        error.uniqueness === Uniqueness.WagerExternalId
       ) {
         const existing = await this.unitOfWork.run((repositories) =>
           this.findExisting(repositories, transaction),
@@ -123,7 +141,15 @@ export class SubmitWagerTransaction {
     repositories: Repositories,
     transaction: WagerTransaction,
     command: SubmitWagerTransactionCommand,
+    inbox: InboxReceipt | undefined,
   ): Promise<SubmitWagerTransactionResult> {
+    if (inbox) {
+      // A duplicate delivery fails here on the primary key and rolls back everything.
+      const message = InboxMessage.receive({ ...inbox, receivedAt: this.clock.now() });
+      message.markProcessed(message.receivedAt);
+      await repositories.inbox.insert(message);
+    }
+
     const known = await this.findExisting(repositories, transaction);
     if (known) return known;
 
@@ -134,10 +160,7 @@ export class SubmitWagerTransaction {
     const committedMeanwhile = await this.findExisting(repositories, transaction);
     if (committedMeanwhile) return committedMeanwhile;
 
-    const { reference, referenceAlreadyReversed } = await this.resolveReference(
-      repositories,
-      transaction,
-    );
+    const { reference, referenceAlreadyReversed } = await resolveReference(repositories, transaction);
     const versionBefore = wallet.version;
     const at = this.clock.now();
     const outcome = settleWagerTransaction({
@@ -155,7 +178,15 @@ export class SubmitWagerTransaction {
       await repositories.wallets.update(wallet, versionBefore);
       await repositories.ledger.append(outcome.entry);
     }
-    await repositories.outbox.enqueue(this.eventsFor(transaction, wallet, outcome, command, at));
+    await repositories.outbox.enqueue(
+      settlementEvents(transaction, wallet, outcome, () => ({
+        eventId: this.ids.next(),
+        correlationId: command.correlationId,
+        causationId: command.causationId,
+        occurredAt: at,
+      })),
+    );
+    await wakeDependents(repositories, transaction, at);
 
     return recorded(transaction, wallet.balance, false);
   }
@@ -178,53 +209,6 @@ export class SubmitWagerTransaction {
       return { outcome: 'IDEMPOTENCY_CONFLICT', transactionId: byExternalId.transaction.id };
     }
     return undefined;
-  }
-
-  private async resolveReference(repositories: Repositories, transaction: WagerTransaction) {
-    if (!transaction.referenceExternalTransactionId) {
-      return { reference: undefined, referenceAlreadyReversed: false };
-    }
-    const stored = await repositories.transactions.findByExternalId(
-      transaction.providerId,
-      transaction.referenceExternalTransactionId,
-    );
-    const reference = stored?.transaction;
-    const referenceAlreadyReversed =
-      reference !== undefined && transaction.requiresReference()
-        ? await repositories.transactions.hasProcessedReversal(reference.id)
-        : false;
-    return { reference, referenceAlreadyReversed };
-  }
-
-  private eventsFor(
-    transaction: WagerTransaction,
-    wallet: Wallet,
-    outcome: SettlementOutcome,
-    command: SubmitWagerTransactionCommand,
-    at: Date,
-  ): OutboxMessage[] {
-    const context = (): EventContext => ({
-      eventId: this.ids.next(),
-      correlationId: command.correlationId,
-      causationId: command.causationId,
-      occurredAt: at,
-    });
-
-    switch (outcome.status) {
-      case WagerTransactionStatus.Processed: {
-        const events = [WagerTransactionProcessed.from(transaction, wallet, context())];
-        const balanceChanged = outcome.entry
-          ? [WalletBalanceChanged.from(wallet, outcome.entry, context())]
-          : [];
-        return [...events, ...balanceChanged].map((event) => OutboxMessage.enqueue(event));
-      }
-      case WagerTransactionStatus.Rejected:
-        return [OutboxMessage.enqueue(WagerTransactionRejected.from(transaction, context()))];
-      case WagerTransactionStatus.PendingReference:
-        return [
-          OutboxMessage.enqueue(WagerTransactionPendingReference.from(transaction, context())),
-        ];
-    }
   }
 }
 

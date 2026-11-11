@@ -1,5 +1,11 @@
 import { Logger } from '@nestjs/common';
-import type { Clock, IdGenerator, Telemetry, WalletDivergence } from '../../application/ports/system';
+import type {
+  Clock,
+  IdGenerator,
+  PendingReferenceFailure,
+  Telemetry,
+  WalletDivergence,
+} from '../../application/ports/system';
 
 export class SystemClock implements Clock {
   now(): Date {
@@ -21,5 +27,9 @@ export class LoggingTelemetry implements Telemetry {
   walletDivergenceDetected(divergence: WalletDivergence): void {
     this.divergences += 1;
     this.logger.error({ ...divergence, divergencesDetected: this.divergences }, 'Wallet balance diverges from ledger');
+  }
+
+  pendingReferenceResolutionFailed({ error, ...failure }: PendingReferenceFailure): void {
+    this.logger.error({ ...failure, err: error }, 'Pending reference could not be resolved');
   }
 }

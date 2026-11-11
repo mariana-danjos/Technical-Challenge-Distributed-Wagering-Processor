@@ -6,6 +6,7 @@ import { APP_CONFIG, type AppConfig } from './infrastructure/config/app-config';
 import { ConfigModule } from './infrastructure/config/config.module';
 import { SqsModule } from './infrastructure/messaging/sqs.module';
 import { createOrmConfig } from './infrastructure/persistence/mikro-orm.config';
+import { WorkersModule } from './infrastructure/workers/workers.module';
 import { resolveCorrelationId } from './interfaces/http/correlation-id';
 import { HttpApiModule } from './interfaces/http/http-api.module';
 
@@ -30,6 +31,7 @@ import { HttpApiModule } from './interfaces/http/http-api.module';
     }),
     SqsModule,
     HttpApiModule,
+    WorkersModule,
   ],
 })
 export class AppModule {}
